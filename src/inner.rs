@@ -46,26 +46,14 @@ impl Inner {
     }
 
     pub fn try_permit(self: &Arc<Self>) -> Result<Permit, Error> {
-        if self.available() >= self.threshold {
+        let available = self.available();
+        if available >= self.threshold {
             Ok(Permit::new(Arc::downgrade(self)))
         } else {
-            Err(Error::ExceedMaxTokens)
+            Err(Error::NotEnoughTokens(
+                self.wait_for(available, self.threshold),
+            ))
         }
-    }
-
-    /// Check if a [`Permit`] is valid for this bucket
-    fn check_permit(&self, permit: Permit) -> Result<(), Error> {
-        permit
-            .0
-            .upgrade()
-            .and_then(|b| {
-                if !std::ptr::eq(Arc::as_ptr(&b), self) {
-                    Some(())
-                } else {
-                    None
-                }
-            })
-            .ok_or(Error::InvalidPermit)
     }
 
     pub fn try_acquire_one(&self, permit: Permit) -> Result<(), Error> {
@@ -74,7 +62,7 @@ impl Inner {
 
     pub fn try_acquire(&self, permit: Permit, num: u64) -> Result<u64, Error> {
         self.check_permit(permit)?;
-        let refill_res = self.refill(self.start.elapsed());
+        self.refill(self.start.elapsed());
 
         // Compare-and-swap loop
         //
@@ -84,10 +72,7 @@ impl Inner {
         for _ in 0..0x10000 {
             let available = self.available.load(Ordering::Acquire);
             if available < num {
-                return Err(Error::NotEnoughTokens(match refill_res {
-                    Ok(_) => self.start.elapsed(),
-                    Err(err) => err,
-                }));
+                return Err(Error::NotEnoughTokens(self.wait_for(available, num)));
             }
 
             let new = available.saturating_sub(num);
@@ -106,15 +91,42 @@ impl Inner {
         Err(Error::HighContention)
     }
 
-    fn refill(&self, elapsed: Duration) -> Result<(), Duration> {
+    /// Check if a [`Permit`] is valid for this bucket
+    fn check_permit(&self, permit: Permit) -> Result<(), Error> {
+        permit
+            .0
+            .upgrade()
+            .and_then(|b| {
+                if std::ptr::eq(&*b, self) {
+                    Some(())
+                } else {
+                    None
+                }
+            })
+            .ok_or(Error::InvalidPermit)
+    }
+
+    /// Calculate the duration until the requested number of tokens will be avilable
+    fn wait_for(&self, available: u64, requested: u64) -> Duration {
+        if requested < available {
+            Duration::ZERO
+        } else {
+            let intervals = (requested - available) / self.refill;
+            Duration::from_millis(self.refill_at.load(Ordering::Acquire))
+                + (self.interval * intervals as u32)
+        }
+    }
+
+    /// Refill tokens if necessary
+    fn refill(&self, elapsed: Duration) {
         let mut intervals;
 
         loop {
             let refill_at = Duration::from_millis(self.refill_at.load(Ordering::Relaxed));
 
-            // Next refill is not due yet, retry later
+            // Next refill is not due yet, return early
             if elapsed < refill_at {
-                return Err(refill_at - elapsed);
+                return;
             }
 
             // Number of intervals
@@ -146,7 +158,5 @@ impl Inner {
         } else {
             self.available.fetch_add(amount, Ordering::Release);
         }
-
-        Ok(())
     }
 }
