@@ -1,9 +1,17 @@
 # Leaky bucket with threshold
 
-This crate implements a leaky bucket algorithm with threshold.
+This crate implements a leaky bucket algorithm with threshold. This can be used in situations where
+one wants to limit operations based on cost metrics, but the cost can only be calculated after the
+operation has run.
 
-A user must present a valid [`Permit`] to acquire tokens in this bucket. The bucket will grant
-a [`Permit`] if the number of tokens is higher than the specified threshold.
+To do so, the [`Bucket`] consists of three main parameters:
+
+* A **refill rate**, adding a number of new tokens in the bucket at regular interval.
+* A **maximum capacity**, above which tokens will leak out of the bucket.
+* A **threshold**, at which the bucket will stop granting new [`Permit`]s.
+
+To take tokens from the [`Bucket`], a user must present a valid [`Permit`]. The bucket will only
+grant a [`Permit`] if the number of tokens in the bucket is higher than the threshold.
 
 ```rust
 # use std::time::Duration;
