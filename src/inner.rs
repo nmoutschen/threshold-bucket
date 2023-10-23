@@ -1,35 +1,28 @@
 use std::{
-    sync::{
-        atomic::{AtomicU64, Ordering},
-        Arc,
-    },
+    sync::atomic::{AtomicU64, Ordering},
     time::{Duration, Instant},
 };
 
-use crate::{Error, Permit};
+use crate::{refill::Refill, Error};
 
 pub(crate) struct Inner {
-    refill: u64,
-    interval: Duration,
-    max: u64,
-    threshold: u64,
+    refill: Box<dyn Refill + Send + Sync>,
 
     /// Currently available number of tokens
     available: AtomicU64,
     start: Instant,
-    refill_at: AtomicU64,
 }
 
 impl Inner {
-    pub fn new(refill: u64, interval: Duration, threshold: u64, max: u64) -> Self {
+    /// Create a new inner bucket
+    pub(crate) fn new<R>(refill: R, initial: u64) -> Self
+    where
+        R: Refill + Send + Sync + 'static,
+    {
         Self {
-            refill,
-            interval,
-            max,
-            threshold,
-            available: AtomicU64::new(threshold + refill),
+            refill: Box::new(refill),
+            available: AtomicU64::new(initial),
             start: Instant::now(),
-            refill_at: AtomicU64::new(interval.as_millis() as u64),
         }
     }
 
@@ -37,31 +30,7 @@ impl Inner {
         self.available.load(Ordering::Acquire)
     }
 
-    pub fn threshold(&self) -> u64 {
-        self.threshold
-    }
-
-    pub fn max(&self) -> u64 {
-        self.max
-    }
-
-    pub fn try_permit(self: &Arc<Self>) -> Result<Permit, Error> {
-        let available = self.available();
-        if available >= self.threshold {
-            Ok(Permit::new(Arc::downgrade(self)))
-        } else {
-            Err(Error::NotEnoughTokens(
-                self.wait_for(available, self.threshold),
-            ))
-        }
-    }
-
-    pub fn try_acquire_one(&self, permit: Permit) -> Result<(), Error> {
-        self.try_acquire(permit, 1).map(|_| ())
-    }
-
-    pub fn try_acquire(&self, permit: Permit, num: u64) -> Result<u64, Error> {
-        self.check_permit(permit)?;
+    pub fn try_acquire(&self, num: u64) -> Result<u64, Error> {
         self.refill(self.start.elapsed());
 
         // Compare-and-swap loop
@@ -72,7 +41,7 @@ impl Inner {
         for _ in 0..0x10000 {
             let available = self.available.load(Ordering::Acquire);
             if available < num {
-                return Err(Error::NotEnoughTokens(self.wait_for(available, num)));
+                return Err(Error::NotEnoughTokens(self.refill.wait_for(available, num)));
             }
 
             let new = available.saturating_sub(num);
@@ -91,72 +60,8 @@ impl Inner {
         Err(Error::HighContention)
     }
 
-    /// Check if a [`Permit`] is valid for this bucket
-    fn check_permit(&self, permit: Permit) -> Result<(), Error> {
-        permit
-            .0
-            .upgrade()
-            .and_then(|b| {
-                if std::ptr::eq(&*b, self) {
-                    Some(())
-                } else {
-                    None
-                }
-            })
-            .ok_or(Error::InvalidPermit)
-    }
-
-    /// Calculate the duration until the requested number of tokens will be avilable
-    fn wait_for(&self, available: u64, requested: u64) -> Duration {
-        if requested < available {
-            Duration::ZERO
-        } else {
-            let intervals = (requested - available) / self.refill;
-            Duration::from_millis(self.refill_at.load(Ordering::Acquire))
-                + (self.interval * intervals as u32)
-        }
-    }
-
     /// Refill tokens if necessary
     fn refill(&self, elapsed: Duration) {
-        let mut intervals;
-
-        loop {
-            let refill_at = Duration::from_millis(self.refill_at.load(Ordering::Relaxed));
-
-            // Next refill is not due yet, return early
-            if elapsed < refill_at {
-                return;
-            }
-
-            // Number of intervals
-            // 1 for the time until `refill_at`, then 1 for every time intervals since then
-            intervals = (1 + (elapsed - refill_at).as_nanos() / self.interval.as_nanos()) as u64;
-
-            // Update the `refill_at` time
-            let next_refill_at = refill_at + (self.interval * intervals as u32);
-            if self
-                .refill_at
-                .compare_exchange(
-                    refill_at.as_millis() as u64,
-                    next_refill_at.as_millis() as u64,
-                    Ordering::AcqRel,
-                    Ordering::Acquire,
-                )
-                .is_ok()
-            {
-                break;
-            }
-        }
-
-        let amount = intervals * self.refill;
-        let available = self.available.load(Ordering::Acquire);
-
-        if available + amount >= self.max {
-            self.available
-                .fetch_add(self.max - available, Ordering::Release);
-        } else {
-            self.available.fetch_add(amount, Ordering::Release);
-        }
+        self.refill.refill(elapsed, &self.available)
     }
 }

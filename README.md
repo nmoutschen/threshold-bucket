@@ -15,27 +15,40 @@ grant a [`Permit`] if the number of tokens in the bucket is higher than the thre
 
 ```rust
 # use std::time::Duration;
-use threshold_bucket::Bucket;
+use threshold_bucket::{
+    refill::RateConfig,
+    permit::ThresholdConfig,
+    Bucket,
+};
 
 # || {
 // Creating a new Bucket with a threshold of 100, max of 200, and a refill of 10 tokens every
 // second.
 // This bucket starts with 110 tokens.
+let refill_rate = RateConfig {
+    quantity: 10,
+    interval: Duration::from_secs(1),
+    max: 200,
+};
+let threshold = ThresholdConfig {
+    threshold: 100,
+};
+
 let bucket = Bucket::builder()
-    .refill_rate(10, Duration::from_secs(1))
-    .threshold(100)
-    .max(200)
+    .rate(refill_rate)
+    .threshold(threshold)
+    .initial(110)
     .build()?;
 
 // We can acquire a permit since there are more than 100 tokens.
-let permit = bucket.try_permit()?;
+let permit = bucket.get_permit().unwrap();
 
 // We now remove 50 tokens, leaving 60 tokens behind.
 let tokens = bucket.try_acquire(permit, 50);
 
-// This will fail, as there are only 60 tokens left in the bucket, less than the threshold
+// This will return `None`, as there are only 60 tokens left in the bucket, less than the threshold
 // value.
-let permit = bucket.try_permit()?;
+let permit = bucket.get_permit();
 
 # Ok::<_, Box<dyn std::error::Error>>(())
 # };
