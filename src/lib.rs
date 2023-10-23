@@ -4,57 +4,45 @@
 use std::{sync::Arc, time::Duration};
 
 mod builder;
-pub use builder::Builder;
 mod inner;
-mod permit;
-pub use permit::Permit;
+pub mod permit;
+pub mod refill;
 
-/// # Leaky bucket with threshold
+pub use builder::Builder;
+use permit::{Permit, Permitter};
+
+/// # Leaky bucket with permitter
 #[derive(Clone)]
-pub struct Bucket(Arc<inner::Inner>);
+pub struct Bucket {
+    permitter: Arc<dyn Permitter>,
+    inner: Arc<inner::Inner>,
+}
 
 impl Bucket {
-    /// Create a new [`Bucket`] with `max` capacity and that refills `refill` tokens every `interval`.
-    ///
-    /// This starts with `refill` + `threshold` tokens in the bucket.
-    pub(crate) fn new(refill: u64, interval: Duration, threshold: u64, max: u64) -> Self {
-        Self(Arc::new(inner::Inner::new(
-            refill, interval, threshold, max,
-        )))
-    }
-
-    /// Create a new bucket [`Builder`].
+    /// Create a new [`Builder`].
     pub fn builder() -> Builder {
-        Builder::new()
+        Builder::default()
     }
 
     /// Number of tokens available in the [`Bucket`].
     pub fn available(&self) -> u64 {
-        self.0.available()
-    }
-
-    /// Threshold before this [`Bucket`] will reject permit grant requests.
-    pub fn threshold(&self) -> u64 {
-        self.0.threshold()
-    }
-
-    /// Maximum number of tokens for this bucket
-    pub fn max(&self) -> u64 {
-        self.0.max()
+        self.inner.available()
     }
 
     /// Try to acquire a [`Permit`].
-    ///
-    /// This will return an [`Error`] when there are no tokens available in the bucket.
-    pub fn try_permit(&self) -> Result<Permit, Error> {
-        self.0.try_permit()
+    pub fn get_permit(&self) -> Option<Permit> {
+        self.permitter.get_permit()
     }
 
     /// Try to acquire one token.
     ///
     /// Shorthand for `try_acquire(permit, 1)`.
     pub fn try_acquire_one(&self, permit: Permit) -> Result<(), Error> {
-        self.0.try_acquire_one(permit)
+        if !self.permitter.belongs(&permit) {
+            return Err(Error::InvalidPermit);
+        }
+        permit.notify(1);
+        self.inner.try_acquire(1).map(|_| ())
     }
 
     /// Try to acquire `num` number of tokens.
@@ -62,16 +50,20 @@ impl Bucket {
     /// This will return an [`Error`] if the permit is invalid, this tries to acquire more token
     /// than available, or it fails to swap the available number of tokens.
     pub fn try_acquire(&self, permit: Permit, num: u64) -> Result<u64, Error> {
-        self.0.try_acquire(permit, num)
+        if !self.permitter.belongs(&permit) {
+            return Err(Error::InvalidPermit);
+        }
+        permit.notify(num);
+        self.inner.try_acquire(num)
     }
 }
 
 /// Bucket build errors
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum BuildError {
-    /// Missing refill_rate for the bucket [`Builder`]
-    #[error("missing refill rate")]
-    MissingRefillRate,
+    /// Missing refill for the bucket [`Builder`]
+    #[error("missing refill")]
+    MissingRefill,
 
     /// Missing max number of tokens for the bucket [`Builder`]
     #[error("missing max")]
@@ -95,5 +87,5 @@ pub enum Error {
 
     /// Not enough tokens available
     #[error("not enough tokens available")]
-    NotEnoughTokens(Duration),
+    NotEnoughTokens(Option<Duration>),
 }

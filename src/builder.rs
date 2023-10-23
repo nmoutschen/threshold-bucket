@@ -1,53 +1,55 @@
-use std::time::Duration;
+use std::sync::Arc;
 
-use crate::{Bucket, BuildError};
+use crate::{
+    permit::{always::AlwaysPermitter, threshold::ThresholdConfig, PermitConfig, Permitter},
+    refill::{rate::RateConfig, RefillConfig},
+    Bucket, BuildError,
+};
 
-/// Builder for [`Bucket`]
+/// Builder for a [`Bucket`]
 #[derive(Default)]
-#[must_use]
 pub struct Builder {
-    max: Option<u64>,
-    threshold: Option<u64>,
-    refill_rate: Option<(u64, Duration)>,
+    initial: Option<u64>,
+    refill_config: Option<RefillConfig>,
+    permit_config: Option<PermitConfig>,
 }
 
 impl Builder {
-    pub(crate) fn new() -> Self {
-        Self::default()
-    }
-
-    /// Set the maximum number of tokens
-    pub fn max(self, max: u64) -> Self {
+    /// Set the initial number of tokens in the [`Bucket`]
+    pub fn initial(self, initial: u64) -> Self {
         Self {
-            max: Some(max),
+            initial: Some(initial),
             ..self
         }
     }
 
-    /// Set the threshold under which the bucket will not grant new permits
-    pub fn threshold(self, threshold: u64) -> Self {
+    /// Use constant refill rate
+    pub fn rate(self, config: RateConfig) -> Self {
         Self {
-            threshold: Some(threshold),
+            refill_config: Some(RefillConfig::Rate(config)),
             ..self
         }
     }
 
-    /// Set the refill rate
-    pub fn refill_rate(self, qty: u64, interval: Duration) -> Self {
+    /// Use threshold-based permit allocation
+    pub fn threshold(self, config: ThresholdConfig) -> Self {
         Self {
-            refill_rate: Some((qty, interval)),
+            permit_config: Some(PermitConfig::Threshold(config)),
             ..self
         }
     }
 
     /// Build the [`Bucket`]
     pub fn build(self) -> Result<Bucket, BuildError> {
-        let (refill, interval) = self.refill_rate.ok_or(BuildError::MissingRefillRate)?;
-        Ok(Bucket::new(
-            refill,
-            interval,
-            self.threshold.unwrap_or(0),
-            self.max.ok_or(BuildError::MissingMax)?,
-        ))
+        let refill = self.refill_config.ok_or(BuildError::MissingRefill)?;
+        let inner = Arc::new(refill.into_inner_bucket(self.initial.unwrap_or(0)));
+        let permitter: Arc<dyn Permitter> = match self.permit_config {
+            Some(PermitConfig::Threshold(threshold_config)) => {
+                Arc::new(threshold_config.into_permitter(inner.clone()))
+            }
+            None => Arc::new(AlwaysPermitter::new(inner.clone())),
+        };
+
+        Ok(Bucket { permitter, inner })
     }
 }
